@@ -1,0 +1,138 @@
+name: Build unsigned IPA
+
+# Builds iCTRLUITests-Runner.ipa and iCTRL.ipa on GitHub's macOS runners and
+# uploads them as artifacts. The IPAs are ad-hoc signed (no provisioning
+# profile), exactly like the ones published on the Releases page: whoever
+# installs them re-signs with SideStore or their own developer account.
+#
+# Nothing here needs an Apple ID: automatic signing is disabled for the build
+# and the packaging step ad-hoc signs the result.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'iCTRLApp/**'
+      - 'iCTRLKit/**'
+      - 'iCTRLUITests/**'
+      - 'iCTRLCompat/**'
+      - 'Scripts/**'
+      - 'Config/**'
+      - 'project.yml'
+      - 'Makefile'
+      - '.github/workflows/build.yml'
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show Xcode version
+        run: xcodebuild -version
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Fetch idevice xcframework (~215MB)
+        run: ./Scripts/fetch-idevice.sh
+
+      # The committed Signing.xcconfig leaves DEVELOPMENT_TEAM empty, and
+      # setup-signing.sh would try to read a keychain certificate that a CI
+      # runner does not have. Write a Local.xcconfig with a placeholder team so
+      # xcodegen has a value to expand; signing itself is disabled below, so
+      # the team never has to be real.
+      - name: Provide a placeholder signing config
+        run: |
+          cat > Config/Local.xcconfig <<'EOF'
+          DEVELOPMENT_TEAM = ABCDE12345
+          ICTRL_BUNDLE_PREFIX = com.example.ci
+          EOF
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      # Build without signing. `build-for-testing` produces both the host app
+      # and the UI-test runner; CODE_SIGNING_ALLOWED=NO keeps the runner's
+      # nested .xctest bundle intact without needing a certificate.
+      - name: Build (unsigned)
+        run: |
+          xcodebuild build-for-testing \
+            -project iCTRL.xcodeproj \
+            -derivedDataPath build \
+            -scheme iCTRL \
+            -destination "generic/platform=iOS" \
+            -allowProvisioningUpdates \
+            ARCHS=arm64 \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY=""
+
+      - name: Locate build products
+        id: products
+        run: |
+          B="build/Build/Products/Debug-iphoneos"
+          echo "dir=$B" >> "$GITHUB_OUTPUT"
+          ls -la "$B"
+
+      # Re-sign ad-hoc, inside out: the runner's nested .xctest bundle has to be
+      # signed before the app that contains it. This mirrors
+      # Scripts/package-release.sh, which assumes a signed build already exists.
+      - name: Ad-hoc sign and package IPAs
+        run: |
+          set -euo pipefail
+          B="build/Build/Products/Debug-iphoneos"
+          OUT="release"
+          rm -rf "$OUT"; mkdir -p "$OUT"
+
+          sign_deep() {
+            local app="$1"
+            # Sign nested bundles first (inside out).
+            find "$app" -name '*.xctest' -maxdepth 3 | while read -r b; do
+              codesign --force --timestamp=none --sign - "$b"
+            done
+            find "$app" -name '*.dylib' | while read -r b; do
+              codesign --force --timestamp=none --sign - "$b"
+            done
+            codesign --force --timestamp=none --sign - "$app"
+            codesign --verify --deep --strict "$app" || true
+          }
+
+          # Runner IPA — the automation engine (required).
+          R="$B/iCTRLUITests-Runner.app"
+          if [ -d "$R" ]; then
+            sign_deep "$R"
+            rm -rf "$OUT/Payload"; mkdir -p "$OUT/Payload"
+            cp -R "$R" "$OUT/Payload/"
+            ( cd "$OUT" && zip -qry iCTRLUITests-Runner.ipa Payload )
+            rm -rf "$OUT/Payload"
+          else
+            echo "::warning::runner app not found"
+          fi
+
+          # Host app IPA — optional (mounts the DDI on-device).
+          A="$B/iCTRL.app"
+          if [ -d "$A" ]; then
+            sign_deep "$A"
+            rm -rf "$OUT/Payload"; mkdir -p "$OUT/Payload"
+            cp -R "$A" "$OUT/Payload/"
+            ( cd "$OUT" && zip -qry iCTRL.ipa Payload )
+            rm -rf "$OUT/Payload"
+          else
+            echo "::warning::host app not found"
+          fi
+
+          ls -la "$OUT"
+          shasum -a 256 "$OUT"/*.ipa
+
+      - name: Upload IPAs
+        uses: actions/upload-artifact@v4
+        with:
+          name: ictrl-ipa-unsigned
+          path: release/*.ipa
+          if-no-files-found: error
+          retention-days: 30
